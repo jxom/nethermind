@@ -201,7 +201,7 @@ namespace Nethermind.Evm.TransactionProcessing
         {
             BlockHeader header = VirtualMachine.BlockExecutionContext.Header;
             IReleaseSpec spec = GetSpec(header);
-            RecoverSenderBeforeIntrinsicGas(tx, spec);
+            RecoverSenderBeforeIntrinsicGas(tx, spec, opts);
             IntrinsicGas<TGasPolicy> intrinsicGas = CalculateIntrinsicGas(tx, spec, header.GasLimit);
             return Execute(tx, tracer, opts, header, spec, in intrinsicGas);
         }
@@ -209,16 +209,21 @@ namespace Nethermind.Evm.TransactionProcessing
         // A sender still missing here is one the background recovery has not reached yet (blocks are
         // processed while it runs); EIP-2780 self-transfer pricing additionally needs the actual signer,
         // so both resolve before intrinsic gas.
-        private void RecoverSenderBeforeIntrinsicGas(Transaction tx, IReleaseSpec spec)
+        private void RecoverSenderBeforeIntrinsicGas(Transaction tx, IReleaseSpec spec, ExecutionOptions opts)
         {
             if (tx.Signature is null) return;
 
             if (tx.SenderAddress is null
-                || (spec.IsEip2780Enabled && tx.IsMessageCall && !WorldState.AccountExists(tx.SenderAddress)))
+                || (spec.IsEip2780Enabled && tx.IsMessageCall && !KeepsSender(tx, opts) && !WorldState.AccountExists(tx.SenderAddress)))
             {
                 tx.SenderAddress = Ecdsa.RecoverAddress(tx, !spec.ValidateChainId);
             }
         }
+
+        // Simulations and replays run without validation and may change the signed content before execution
+        // (a nonce loaded from state, a capped gas limit), so recovering from it would yield an unrelated address.
+        private static bool KeepsSender(Transaction tx, ExecutionOptions opts) =>
+            tx.SenderAddress is not null && opts.HasFlag(ExecutionOptions.SkipValidation);
 
         [SkipLocalsInit]
         private TransactionResult Execute(Transaction tx, ITxTracer tracer, ExecutionOptions opts, BlockHeader header, IReleaseSpec spec, in IntrinsicGas<TGasPolicy> intrinsicGas)
@@ -1051,7 +1056,7 @@ namespace Nethermind.Evm.TransactionProcessing
 
                 // Message calls under EIP-2780 were re-recovered against this state before intrinsic gas;
                 // repeating it here would only redo that work.
-                if (tx.Signature is not null && (!spec.IsEip2780Enabled || !tx.IsMessageCall))
+                if (tx.Signature is not null && (!spec.IsEip2780Enabled || !tx.IsMessageCall) && !KeepsSender(tx, opts))
                     tx.SenderAddress = Ecdsa.RecoverAddress(tx, !spec.ValidateChainId);
 
                 if (sender != tx.SenderAddress)

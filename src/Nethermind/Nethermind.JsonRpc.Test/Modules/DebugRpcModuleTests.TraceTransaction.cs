@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading.Tasks;
 using Autofac;
 using Nethermind.Blockchain.Headers;
@@ -57,6 +58,40 @@ public partial class DebugRpcModuleTests
         await RpcTest.TestSerializedRequest(context.DebugRpcModule, "debug_traceTransaction", transaction.Hash, options);
 
         Assert.That(header.BaseFeePerGas, Is.EqualTo(baseFee), "block override must not write into the block-tree-cached header");
+    }
+
+    /// <summary>
+    /// Regression: the replay writes the nonce it loads from state into each transaction, so a nonce override must not
+    /// reach the transactions the block tree caches.
+    /// </summary>
+    [Test]
+    public async Task Debug_trace_with_nonce_override_does_not_mutate_cached_transaction(
+        [Values("debug_traceTransaction", "debug_traceBlockByHash", "debug_intermediateRoots", "debug_standardTraceBlockToFile")] string method)
+    {
+        using Context context = await Context.Create();
+
+        Transaction transaction = await AddBlockWithTransfer(context);
+        Hash256 blockHash = context.Blockchain.BlockTree.Head!.Hash!;
+        ulong nonce = transaction.Nonce;
+
+        GethTraceOptions options = new()
+        {
+            StateOverrides = new Dictionary<Address, AccountOverride> { [TestItem.AddressA] = new() { Nonce = nonce + 5 } }
+        };
+        string response = await RpcTest.TestSerializedRequest(context.DebugRpcModule, method,
+            method == "debug_traceTransaction" ? transaction.Hash : blockHash, options);
+        if (method == "debug_standardTraceBlockToFile")
+        {
+            foreach (JToken file in JToken.Parse(response)["result"] ?? new JArray())
+                File.Delete(file.Value<string>()!);
+        }
+
+        Transaction cached = context.Blockchain.BlockTree.FindBlock(blockHash, BlockTreeLookupOptions.None)!.Transactions[0];
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(JToken.Parse(response)["error"], Is.Null, response);
+            Assert.That(cached.Nonce, Is.EqualTo(nonce), "a state override must not write into the block-tree-cached transaction");
+        }
     }
 
     // Zero is the case where the overridden target would pass for genesis and open pre-genesis state; a cold

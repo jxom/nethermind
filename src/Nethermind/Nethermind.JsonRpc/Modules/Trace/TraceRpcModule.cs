@@ -153,6 +153,8 @@ namespace Nethermind.JsonRpc.Modules.Trace
             {
                 RlpReader ctx = new(data);
                 Transaction tx = _txDecoder.DecodeCompleteNotNull(ref ctx, RlpBehaviors.SkipTypedWrapping);
+                // The cap changes the signed content, so the sender is recovered first.
+                tx.SenderAddress ??= blockchainBridge.RecoverTxSender(tx);
                 tx.CapGasLimit(jsonRpcConfig.GasCap);
                 return TraceTx(tx, traceTypes, BlockParameter.Latest);
             }
@@ -173,7 +175,8 @@ namespace Nethermind.JsonRpc.Modules.Trace
 
             BlockHeader header = headerSearch.Object!.Clone();
             Block block = new(header, [tx], []);
-            ParityTraceTypes parityTypes = GetParityTypes(traceTypes);
+            // Rewards belong to full blocks: here the reward of the block the call runs in would be a second trace.
+            ParityTraceTypes parityTypes = GetParityTypes(traceTypes) & ~ParityTraceTypes.Rewards;
 
             return BuildStreamingSingleResult(
                 runStreaming: (writer, pipeWriter, ct) =>
@@ -433,8 +436,12 @@ namespace Nethermind.JsonRpc.Modules.Trace
         public ResultWrapper<IEnumerable<ParityTxTraceFromStore>> trace_get(Hash256 txHash, long[] positions)
         {
             ResultWrapper<IEnumerable<ParityTxTraceFromStore>> traceTransaction = trace_transaction(txHash);
-            List<ParityTxTraceFromStore> traces = ExtractPositionsFromTxTrace(positions, traceTransaction);
-            return ResultWrapper<IEnumerable<ParityTxTraceFromStore>>.Success(traces);
+            if (!traceTransaction.Result) return traceTransaction;
+            using (traceTransaction)
+            {
+                List<ParityTxTraceFromStore> traces = ExtractPositionsFromTxTrace(positions, traceTransaction);
+                return ResultWrapper<IEnumerable<ParityTxTraceFromStore>>.Success(traces);
+            }
         }
 
         public static List<ParityTxTraceFromStore> ExtractPositionsFromTxTrace(long[] positions, ResultWrapper<IEnumerable<ParityTxTraceFromStore>> traceTransaction)
@@ -444,7 +451,7 @@ namespace Nethermind.JsonRpc.Modules.Trace
             for (int index = 0; index < positions.Length; index++)
             {
                 long position = positions[index];
-                if (transactionTraces.Length > position + 1)
+                if (position >= -1 && position < transactionTraces.Length - 1)
                 {
                     ParityTxTraceFromStore tr = transactionTraces[position + 1];
                     traces.Add(tr);

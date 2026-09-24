@@ -133,6 +133,34 @@ public partial class DebugRpcModuleTests
         Assert.That((int)trace["errorCode"]!, Is.EqualTo(ErrorCodes.InvalidInput), "tracing-failure errorCode mirrors the buffered ErrorCodes.InvalidInput");
     }
 
+    /// <summary>
+    /// Regression: the plain (no overrides) path traces each call the way <c>debug_traceCall</c> does, so a call carrying
+    /// a genuine transaction's fields and signature must not leave a wrong sender in the process-wide sender cache either.
+    /// </summary>
+    [Test]
+    public async Task Debug_traceCallMany_does_not_poison_sender_cache_for_genuine_tx([Values] bool streaming)
+    {
+        using Context ctx = await Context.Create(new TestSpecProvider(Cancun.Instance));
+        ctx.Blockchain.Container.Resolve<IJsonRpcConfig>().EnableTracingStreamMode = streaming;
+
+        ulong chainId = ctx.Blockchain.SpecProvider.ChainId;
+        (Transaction genuineTx, Transaction networkTx, Address trueSigner) = SenderCacheTestScenario.BuildGenuineTypedTx(ctx.Blockchain.EthereumEcdsa, chainId);
+        EIP1559TransactionForRpc rpcTx = SenderCacheTestScenario.BuildRpcClone(genuineTx, TestItem.AddressF, chainId);
+
+        JArray result = await RunTraceCallManyAsJson(ctx, [CreateBundle(rpcTx)]);
+
+        // The sender recovered for the fresh `from` is unfunded, so the call fails after the recovery under test. Only the
+        // streamed trace carries the error.
+        JToken trace = result[0][0]!;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That((bool)trace["failed"]!, Is.True);
+            if (streaming) Assert.That((string?)trace["error"], Does.Contain("insufficient funds"));
+        }
+
+        SenderCacheTestScenario.AssertRecoversTrueSigner(ctx.Blockchain.EthereumEcdsa, networkTx, trueSigner);
+    }
+
     [Test]
     public async Task Debug_traceCallMany_respects_gas_cap()
     {

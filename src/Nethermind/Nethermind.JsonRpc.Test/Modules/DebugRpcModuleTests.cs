@@ -16,6 +16,7 @@ using Nethermind.Core.Test.Builders;
 using Nethermind.Evm;
 using Nethermind.Evm.Tracing;
 using Nethermind.Evm.TransactionProcessing;
+using Nethermind.Facade.Eth.RpcTransaction;
 using Nethermind.Int256;
 using Nethermind.JsonRpc.Modules.DebugModule;
 using Nethermind.Specs;
@@ -499,6 +500,36 @@ public partial class DebugRpcModuleTests
             Assert.That((string?)frame["error"], Is.EqualTo("execution reverted"));
             Assert.That(frame["to"], Is.Null, "a failed CREATE deploys no contract, so `to` must be omitted");
         });
+    }
+
+    /// <summary>
+    /// Regression: a <c>debug_traceCall</c> carrying a genuine transaction's fields and signature must not leave a wrong
+    /// sender for that transaction in the process-wide sender cache when replay loads the nonce from state.
+    /// </summary>
+    /// <remarks>A fresh <c>from</c> makes the processor recover the sender, which is unfunded, so the trace fails after the
+    /// recovery under test; an existing one does not recover and is the control. Streamed, the trace runs while the
+    /// response is written.</remarks>
+    [Test]
+    public async Task Debug_traceCall_does_not_poison_sender_cache_for_genuine_tx([Values] bool fromExistingAccount, [Values] bool streaming)
+    {
+        using TestRpcBlockchain chain = await TestRpcBlockchain
+            .ForTest(SealEngineType.NethDev)
+            .WithConfig(new JsonRpcConfig { EnableTracingStreamMode = streaming })
+            .Build(new TestSpecProvider(Cancun.Instance));
+
+        ulong chainId = chain.SpecProvider.ChainId;
+        (Transaction genuineTx, Transaction networkTx, Address trueSigner) = SenderCacheTestScenario.BuildGenuineTypedTx(chain.EthereumEcdsa, chainId);
+        EIP1559TransactionForRpc rpcTx = SenderCacheTestScenario.BuildRpcClone(genuineTx, fromExistingAccount ? TestItem.AddressA : TestItem.AddressF, chainId);
+
+        string response = await RpcTest.TestSerializedRequest(chain.DebugRpcModule, "debug_traceCall", rpcTx, "latest");
+
+        // Streamed, a failed trace is a result with `failed: true`; buffered, it is an error response.
+        if (fromExistingAccount)
+            Assert.That((bool?)JToken.Parse(response)["result"]?["failed"], Is.False, response);
+        else
+            Assert.That(response, Does.Contain("insufficient funds"));
+
+        SenderCacheTestScenario.AssertRecoversTrueSigner(chain.EthereumEcdsa, networkTx, trueSigner);
     }
 
     private sealed class PrefixCountingAdapter(ITransactionProcessorAdapter inner, List<Hash256?> executed) : ITransactionProcessorAdapter

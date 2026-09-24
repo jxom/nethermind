@@ -5,6 +5,8 @@ using System.Collections.Generic;
 using Nethermind.Core.Crypto;
 using Nethermind.Core.Test.Builders;
 using Nethermind.Crypto;
+using Nethermind.Serialization.Rlp;
+using NSubstitute;
 using NUnit.Framework;
 
 namespace Nethermind.Core.Test.Crypto
@@ -128,8 +130,7 @@ namespace Nethermind.Core.Test.Crypto
             Assert.That(address, Is.EqualTo(key.Address));
         }
 
-        // Typed txs are served from the hash-keyed sender cache on repeat recovery; legacy txs
-        // are excluded (signing hash depends on the ambient chain id)
+        // Typed txs are served from the sender cache on repeat recovery; legacy txs are not cached
         [TestCase(TxType.EIP1559, true)]
         [TestCase(TxType.Legacy, false)]
         public void RecoverAddress_repeat_recovery_uses_sender_cache_for_typed_tx_only(TxType txType, bool servedFromCache)
@@ -140,7 +141,6 @@ namespace Nethermind.Core.Test.Crypto
 
             EthereumEcdsa ecdsa = new(BlockchainIds.Sepolia);
             PrivateKey keyA = TestItem.PrivateKeyA;
-            PrivateKey keyB = TestItem.PrivateKeyB;
             // Unique content per case so the process-wide cache cannot collide across tests
             static Transaction Create(TxType txType) => Build.A.Transaction
                 .WithType(txType)
@@ -152,13 +152,64 @@ namespace Nethermind.Core.Test.Crypto
             txA.Hash = txA.CalculateHash();
             Assert.That(ecdsa.RecoverAddress(txA), Is.EqualTo(keyA.Address));
 
-            // Same hash, different signature: a cache hit returns the previously recovered
-            // sender, a recompute returns keyB's address
-            Transaction txB = Create(txType);
-            ecdsa.Sign(keyB, txB);
-            txB.Hash = txA.Hash;
+            // An ecdsa that recovers nothing: only a cache hit returns the previously recovered sender
+            Assert.That(NonRecoveringEcdsa(ecdsa.ChainId).RecoverAddress(txA), Is.EqualTo(servedFromCache ? keyA.Address : null));
+        }
 
-            Assert.That(ecdsa.RecoverAddress(txB), Is.EqualTo(servedFromCache ? keyA.Address : keyB.Address));
+        public enum ChangeAfterHash { Nonce, Signature, RecoveryId }
+
+        /// <summary>
+        /// Regression: a transaction whose nonce, signature or recovery id changed after its hash was set keeps the
+        /// genuine transaction's hash but not its sender. Neither may be served the sender recovered for the other.
+        /// </summary>
+        [Test]
+        public void RecoverAddress_of_tx_changed_after_its_hash_was_set_recovers_its_own_sender([Values] ChangeAfterHash change)
+        {
+            EthereumEcdsa ecdsa = new(BlockchainIds.Sepolia);
+            // Unique content per case, which nothing else recovers, so the process-wide cache holds no entry for it.
+            Transaction genuine = Build.A.Transaction
+                .WithType(TxType.EIP1559)
+                .WithChainId(BlockchainIds.Sepolia)
+                .WithNonce(0xFACADEUL + (ulong)change)
+                .SignedAndResolved(ecdsa, TestItem.PrivateKeyA)
+                .TestObject;
+            byte[] encoded = TxDecoder.Instance.Encode(genuine, RlpBehaviors.SkipTypedWrapping).Bytes;
+
+            // Decoded, the hash comes from the raw bytes and stays when the transaction changes.
+            Transaction changed = Rlp.Decode<Transaction>(encoded, RlpBehaviors.SkipTypedWrapping)!;
+            switch (change)
+            {
+                case ChangeAfterHash.Nonce:
+                    changed.Nonce++;
+                    break;
+                case ChangeAfterHash.Signature:
+                    ecdsa.Sign(TestItem.PrivateKeyB, changed);
+                    break;
+                case ChangeAfterHash.RecoveryId:
+                    // Same signing hash, r and s: the other parity recovers another valid key.
+                    Signature signature = changed.Signature!;
+                    changed.Signature = new Signature(signature.RAsSpan, signature.SAsSpan, (ulong)(Signature.VOffset + 1 - signature.RecoveryId));
+                    break;
+            }
+            Address? changedSender = ecdsa.RecoverAddress(changed);
+
+            Transaction received = Rlp.Decode<Transaction>(encoded, RlpBehaviors.SkipTypedWrapping)!;
+            Address? receivedSender = ecdsa.RecoverAddress(received);
+            Address? changedSenderAgain = ecdsa.RecoverAddress(changed);
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(changed.Hash, Is.EqualTo(received.Hash), "the changed transaction keeps the genuine hash");
+                Assert.That(changedSender, Is.Not.Null.And.Not.EqualTo(TestItem.PrivateKeyA.Address), "the changed transaction recovers to another sender");
+                Assert.That(receivedSender, Is.EqualTo(TestItem.PrivateKeyA.Address), "the genuine transaction, after the changed one");
+                Assert.That(changedSenderAgain, Is.EqualTo(changedSender), "the changed transaction, after the genuine one");
+            }
+        }
+
+        private static IEthereumEcdsa NonRecoveringEcdsa(ulong chainId)
+        {
+            IEthereumEcdsa ecdsa = Substitute.For<IEthereumEcdsa>();
+            ecdsa.ChainId.Returns(chainId);
+            return ecdsa;
         }
 
         [Test]
